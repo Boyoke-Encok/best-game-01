@@ -3,27 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FLIPBOUND — flip gravity, gather the shards, break the Core</title>
+<title>EMBERFALL — survive the hollow night</title>
 <style>
-  html, body { margin: 0; padding: 0; background: #070818; height: 100%; }
-  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-  #wrap { text-align: center; }
-  canvas { display: block; width: 960px; height: 540px; max-width: 96vw; max-height: 90vh;
-    image-rendering: auto; background: #0b1030; border: 2px solid #1e2a4a; border-radius: 8px;
-    box-shadow: 0 0 60px rgba(60, 120, 255, 0.25); }
-  .hint { color: #5a6a8a; font: 13px monospace; margin-top: 10px; }
+  html, body { margin: 0; padding: 0; background: #0a0817; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #wrap { position: relative; width: 960px; height: 540px; }
+  canvas { display: block; width: 960px; height: 540px; background: #0a0817; border-radius: 6px; }
+  #hint { position: absolute; left: 0; right: 0; bottom: -22px; text-align: center;
+    color: #6f6a94; font: 12px/1.4 monospace; }
 </style>
 </head>
 <body>
 <div id="wrap">
   <canvas id="game" width="960" height="540"></canvas>
-  <div class="hint">FLIPBOUND — Arrows/WASD move · Space jump · Shift/X flip gravity · P pause · M mute</div>
+  <div id="hint">EMBERFALL — Arrows/WASD move &middot; Space jump is not needed, weapons fire on their own &middot; P pause &middot; M mute &middot; R restart</div>
 </div>
-<script src="audio.js"></script>
-<script src="levels.js"></script>
-<script src="physics.js"></script>
-<script src="entities.js"></script>
-<script src="render.js"></script>
-<script src="main.js"></script>
+<script type="module" src="main.js"></script>
 </body>
 </html>
