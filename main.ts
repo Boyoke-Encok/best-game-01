@@ -1,4 +1,4 @@
-// EMBERFALL — a best-game-01 entry (Node 22, standard library only). The
+// SPROUT SIEGE — a best-game-01 entry (Node 22, standard library only). The
 // game is this directory's game/ folder: plain static files a desktop browser
 // loads offline (game/index.html and its ES modules, no library, no network
 // request). This program hands it in: it copies game/ and screenshots/ from

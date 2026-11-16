@@ -3,21 +3,97 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EMBERFALL — survive the hollow night</title>
+<title>SPROUT SIEGE — defend the last garden</title>
 <style>
-  html, body { margin: 0; padding: 0; background: #0a0817; height: 100%; overflow: hidden; }
-  body { display: flex; align-items: center; justify-content: center; }
-  #wrap { position: relative; width: 960px; height: 540px; }
-  canvas { display: block; width: 960px; height: 540px; background: #0a0817; border-radius: 6px; }
-  #hint { position: absolute; left: 0; right: 0; bottom: -22px; text-align: center;
-    color: #6f6a94; font: 12px/1.4 monospace; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1d3319; font-family: system-ui, -apple-system, sans-serif; color: #eaf5e6; display: flex; justify-content: center; padding: 8px; }
+  #app { width: 960px; }
+  #hud { display: flex; gap: 14px; align-items: center; background: #2c4a26; border-radius: 10px 10px 0 0; padding: 8px 12px; font-size: 15px; font-weight: 600; flex-wrap: wrap; }
+  #hud .stat { white-space: nowrap; }
+  #hud-next { color: #ffe08a; font-weight: 500; }
+  #hud button, .overlay button { background: #f7c948; color: #2d1f14; border: none; border-radius: 8px; padding: 7px 12px; font-weight: 700; cursor: pointer; font-size: 14px; }
+  #hud button:hover:not(:disabled), .overlay button:hover { background: #ffd93b; }
+  #hud button:disabled { opacity: 0.45; cursor: default; }
+  #wrap { position: relative; width: 960px; height: 440px; }
+  canvas { display: block; width: 960px; height: 440px; background: #43803a; }
+  #towerbar { display: flex; gap: 8px; background: #2c4a26; border-radius: 0 0 10px 10px; padding: 8px 12px; align-items: stretch; }
+  .tower-card { flex: 1; background: #3e6b34; color: #eaf5e6; border: 2px solid transparent; border-radius: 10px; padding: 8px 10px; cursor: pointer; text-align: left; font-size: 13px; display: flex; flex-direction: column; gap: 2px; }
+  .tower-card:hover:not(:disabled) { border-color: #ffd93b; }
+  .tower-card.active { border-color: #ffd93b; background: #4a7d3c; }
+  .tower-card:disabled { opacity: 0.45; cursor: default; }
+  .tower-card .cost { color: #ffd93b; font-weight: 700; }
+  .tower-card .desc { color: #cfe8c6; font-size: 12px; }
+  .tower-card .key { color: #9db894; font-size: 11px; }
+  #sel-info { flex: 1.4; background: #24401f; border-radius: 10px; padding: 8px 10px; font-size: 13px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  #sel-info button { background: #7fe3f0; color: #123; border: none; border-radius: 6px; padding: 5px 9px; font-weight: 700; cursor: pointer; }
+  #sel-info button:hover { background: #a5ecf5; }
+  .overlay { position: absolute; inset: 0; background: rgba(20, 40, 16, 0.88); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; border-radius: 0 0 10px 10px; z-index: 5; }
+  .overlay h1 { font-size: 52px; color: #ffd93b; letter-spacing: 2px; text-shadow: 0 3px 0 #7a5c00; }
+  .overlay h2 { font-size: 40px; color: #ffd93b; }
+  .overlay p { max-width: 560px; line-height: 1.5; color: #d9ecd2; }
+  .overlay .big { font-size: 22px; font-weight: 800; color: #ffffff; }
+  .overlay .keys { font-size: 13px; color: #b8d3ae; }
+  .hidden { display: none !important; }
+  #help-box { background: #24401f; border-radius: 8px; padding: 10px 14px; font-size: 13px; text-align: left; line-height: 1.6; }
+  #help-box b { color: #ffd93b; }
 </style>
 </head>
 <body>
-<div id="wrap">
-  <canvas id="game" width="960" height="540"></canvas>
-  <div id="hint">EMBERFALL — Arrows/WASD move &middot; Space jump is not needed, weapons fire on their own &middot; P pause &middot; M mute &middot; R restart</div>
+<div id="app">
+  <div id="hud">
+    <span class="stat" id="hud-gold">🪙 160</span>
+    <span class="stat" id="hud-lives">❤ 20</span>
+    <span class="stat" id="hud-wave">Wave –/15</span>
+    <span class="stat" id="hud-score">Score 0</span>
+    <span class="stat" id="hud-kills">Kills 0</span>
+    <span class="stat" id="hud-left"></span>
+    <span id="hud-next"></span>
+    <span style="flex:1"></span>
+    <button id="btn-wave">▶ Start Wave 1</button>
+    <button id="btn-speed">⏩ 1×</button>
+    <button id="btn-pause">⏸ Pause</button>
+    <button id="btn-mute">🔊 Sound</button>
+    <button id="btn-restart">↻ Restart</button>
+  </div>
+  <div id="wrap">
+    <canvas id="game" width="960" height="440"></canvas>
+    <div class="overlay" id="overlay-title">
+      <h1>SPROUT SIEGE</h1>
+      <p><b>Defend the last garden.</b> Pests march down the dirt path to the Seed Vault. Build plant towers on the grass, stop all 15 waves, and slay the Mole King.</p>
+      <p class="keys">Click a tower card (or press 1–4), then click a grass cell to build · Click a tower to upgrade or sell · <b>Space</b> start wave · <b>F</b> fast-forward · <b>P</b> pause · <b>M</b> mute · <b>R</b> restart · Right-click cancels placement</p>
+      <p>4 towers · 6 pests + 3 bosses · upgrades · best score <span id="title-best">0</span></p>
+      <button id="btn-start">▶ START</button>
+      <button id="btn-help">How to play</button>
+      <div id="help-box" class="hidden">
+        <b>Daisy Dart</b> (🪙50) — rapid shots, cheap and everywhere.<br>
+        <b>Thorn Lash</b> (🪙100) — slow, heavy hits; best against bosses.<br>
+        <b>Frost Mint</b> (🪙80) — chills pests, slowing them 45%.<br>
+        <b>Pumpkin Splash</b> (🪙120) — splash damage for packed groups.<br>
+        Pests leak past your towers and cost lives — <b>20 lives</b>, lose them all and the garden falls. Kill pests for gold, clear waves for bonuses, upgrade towers to level 3. Wave 5: Goliath Beetle. Wave 10: Locust Queen. Wave 15: the Mole King.
+      </div>
+    </div>
+    <div class="overlay hidden" id="overlay-win">
+      <h2>🌻 GARDEN SAVED! 🌻</h2>
+      <p class="big">Score <span id="win-score">0</span></p>
+      <p id="win-detail"></p>
+      <p>Best score: <span id="win-best">0</span></p>
+      <button id="btn-again-win">↻ Play again</button>
+    </div>
+    <div class="overlay hidden" id="overlay-lose">
+      <h2>🥀 THE GARDEN FELL</h2>
+      <p class="big">Score <span id="lose-score">0</span></p>
+      <p id="lose-detail"></p>
+      <p>Best score: <span id="lose-best">0</span></p>
+      <button id="btn-again-lose">↻ Try again</button>
+    </div>
+    <div class="overlay hidden" id="overlay-paused">
+      <h2>⏸ PAUSED</h2>
+      <p>Press P or the Resume button to keep defending.</p>
+    </div>
+  </div>
+  <div id="towerbar"></div>
+  <div id="sel-info" style="margin-top:8px; background:#2c4a26; border-radius:10px; padding:8px 12px; font-size:13px;">Click a tower card (or press 1–4), then click a grass cell to build.</div>
 </div>
-<script type="module" src="main.js"></script>
+<script type="module" src="./main.js"></script>
 </body>
 </html>

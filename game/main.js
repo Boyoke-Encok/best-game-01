@@ -1,409 +1,597 @@
-// EMBERFALL — boot, fixed-step loop, states, collisions, bot, debug hooks.
-import { VIEW_W, VIEW_H, WORLD_W, WORLD_H, BOSS_TIME, WEAPONS } from './defs.js';
-import { makePlayer, updatePlayer, hurtPlayer, hurtEnemy, addKill } from './player.js';
-import { updateEnemy, onEnemyKilled } from './enemies.js';
-import { makeWorld, updateWorld } from './world.js';
-import { makeFx, updateFx, burst, addShake } from './fx.js';
-import { rollCards, applyCard, weaponStats } from './upgrades.js';
-import { drawGame, drawTitle, drawLevelUp, drawPause, drawEnd } from './render.js';
-import { ensureAudio, toggleMute, Sound } from './audio.js';
+// SPROUT SIEGE — game state, loop, input, HUD, wave flow, autoplay bot.
+import { COLS, ROWS, CELL, W, H, TOWERS, TOWER_ORDER, TOTAL_WAVES, START_GOLD, START_LIVES, waveClearBonus, BASE_CELL } from './defs.js';
+import { cellCenter, pathLength, isBuildable, spotScore } from './path.js';
+import { createTower, towerDef, towerRangeNow, towerDamageNow, canUpgrade, getUpgradeCost, upgradeTower, sellValue, updateTower } from './towers.js';
+import { createEnemy, damageEnemy, slowEnemy, healAura, updateEnemy, splitEnemy } from './enemies.js';
+import { buildQueue, wavePreview } from './waves.js';
+import { sfx, ensureAudio, setMuted, isMuted } from './audio.js';
+import { makeFx, burst, leafBurst, floatText, updateFx } from './fx.js';
+import { draw } from './render.js';
 import { loadBest, saveBest } from './storage.js';
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
 const G = {
-  ...makeWorld(),
-  player: null, fx: makeFx(),
-  weapons: { bolt: { level: 1, cd: 0, angle: 0 } },
-  passives: {},
-  state: 'title', // title | play | levelup | pause | over | win
-  camX: 0, camY: 0,
-  cards: [], cardRects: [],
-  bossWarn: 0, winT: 0, best: loadBest(),
-  input: { up: false, down: false, left: false, right: false },
-  levelupT: 0, overT: 0,
+  state: 'title', // title | play | win | over
+  paused: false,
+  speed: 1,
+  time: 0,
+  gold: START_GOLD,
+  lives: START_LIVES,
+  score: 0,
+  kills: 0,
+  wave: 0,
+  waveActive: false,
+  waveTime: 0,
+  queue: [],
+  queueIdx: 0,
+  hpMul: 1,
+  waveTotal: 0,
+  towers: [],
+  enemies: [],
+  projectiles: [],
+  fx: makeFx(),
+  best: loadBest(),
+  selected: null,
+  placing: null,
+  hover: null,
+  autoplay: false,
+  botT: 0,
+  damageDealt: 0,
 };
-G.player = makePlayer(WORLD_W / 2, WORLD_H / 2);
-G.WORLD_W = WORLD_W; G.WORLD_H = WORLD_H;
 
-function resetRun() {
-  const keep = { best: G.best };
-  Object.assign(G, makeWorld());
-  G.player = makePlayer(WORLD_W / 2, WORLD_H / 2);
-  G.fx = makeFx();
-  G.weapons = { bolt: { level: 1, cd: 0, angle: 0 } };
-  G.passives = {};
+// Best tower cells, computed once: sorted by path coverage.
+const SPOT_CACHE = (() => {
+  const list = [];
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      if (isBuildable(col, row, [])) list.push({ col, row, score: spotScore(col, row, 100) });
+    }
+  }
+  list.sort((a, b) => b.score - a.score);
+  return list;
+})();
+
+const $ = id => document.getElementById(id);
+const hud = {
+  gold: $('hud-gold'), lives: $('hud-lives'), wave: $('hud-wave'), score: $('hud-score'),
+  kills: $('hud-kills'), left: $('hud-left'), next: $('hud-next'),
+  waveBtn: $('btn-wave'), speedBtn: $('btn-speed'), pauseBtn: $('btn-pause'),
+  muteBtn: $('btn-mute'), restartBtn: $('btn-restart'),
+  towerBar: $('towerbar'), selInfo: $('sel-info'),
+  title: $('overlay-title'), win: $('overlay-win'), lose: $('overlay-lose'),
+  paused: $('overlay-paused'),
+  winScore: $('win-score'), winBest: $('win-best'), winDetail: $('win-detail'),
+  loseScore: $('lose-score'), loseBest: $('lose-best'), loseDetail: $('lose-detail'),
+  titleBest: $('title-best'),
+};
+
+function fmt(n) { return String(Math.floor(n)); }
+
+function updateHud() {
+  hud.gold.textContent = '🪙 ' + fmt(G.gold);
+  hud.lives.textContent = '❤ ' + fmt(G.lives);
+  hud.wave.textContent = 'Wave ' + (G.wave === 0 ? '–' : G.wave) + '/' + TOTAL_WAVES;
+  hud.score.textContent = 'Score ' + fmt(G.score);
+  hud.kills.textContent = 'Kills ' + fmt(G.kills);
+  const left = (G.queue.length - G.queueIdx) + G.enemies.length;
+  hud.left.textContent = G.waveActive ? 'Pests left ' + left : '';
+  if (!G.waveActive && G.state === 'play' && G.wave < TOTAL_WAVES) {
+    hud.next.textContent = 'Next: ' + wavePreview(G.wave + 1);
+  } else if (G.waveActive) {
+    hud.next.textContent = 'Wave ' + G.wave + ' in progress';
+  } else {
+    hud.next.textContent = '';
+  }
+  hud.waveBtn.disabled = G.waveActive || G.state !== 'play' || G.wave >= TOTAL_WAVES;
+  hud.waveBtn.textContent = G.wave === 0 ? '▶ Start Wave 1' : '▶ Start Wave ' + (G.wave + 1);
+  hud.speedBtn.textContent = '⏩ ' + G.speed + '×';
+  hud.pauseBtn.textContent = G.paused ? '▶ Resume' : '⏸ Pause';
+  hud.muteBtn.textContent = isMuted() ? '🔇 Muted' : '🔊 Sound';
+  renderTowerBar();
+}
+
+let towerBarSig = '';
+function renderTowerBar() {
+  // Rebuilding innerHTML destroys the Upgrade/Sell buttons under the
+  // player's cursor, so only re-render when something visible changed.
+  const s = G.selected;
+  const sig = [
+    G.state, G.placing,
+    s ? s.type + ':' + s.level : 'none',
+    TOWER_ORDER.map(id => G.gold >= TOWERS[id].cost ? 1 : 0).join(''),
+  ].join('|');
+  if (sig === towerBarSig) return;
+  towerBarSig = sig;
+  hud.towerBar.innerHTML = '';
+  for (const id of TOWER_ORDER) {
+    const def = TOWERS[id];
+    const b = document.createElement('button');
+    b.className = 'tower-card' + (G.placing === id ? ' active' : '');
+    b.innerHTML = `<b>${def.name}</b><span class="cost">🪙 ${def.cost}</span><span class="desc">${def.desc}</span><span class="key">[${TOWER_ORDER.indexOf(id) + 1}]</span>`;
+    b.disabled = G.state !== 'play' || G.gold < def.cost;
+    b.onclick = () => { ensureAudio(); selectPlacing(G.placing === id ? null : id); };
+    hud.towerBar.appendChild(b);
+  }
+  // Selected-tower panel.
+  if (s) {
+    const def = towerDef(s);
+    const up = canUpgrade(s) ? ` <button id="btn-up">⬆ Upgrade 🪙 ${getUpgradeCost(s)}</button>` : ' <span>MAX level</span>';
+    hud.selInfo.innerHTML =
+      `<b>${def.name} Lv${s.level}</b> · dmg ${towerDamageNow(s)} · range ${towerRangeNow(s)}${up} <button id="btn-sell">Sell 🪙 ${sellValue(s)}</button>`;
+    const upBtn = document.getElementById('btn-up');
+    if (upBtn) upBtn.onclick = () => { tryUpgrade(s); };
+    document.getElementById('btn-sell').onclick = () => { sellTower(s); };
+  } else {
+    hud.selInfo.innerHTML = G.placing
+      ? `Placing <b>${TOWERS[G.placing].name}</b> — click a grass cell (right-click / Esc to cancel)`
+      : 'Click a tower card (or press 1–4), then click a grass cell to build.';
+  }
+}
+
+function selectPlacing(id) {
+  G.placing = id;
+  G.selected = null;
+  updateHud();
+}
+
+function tryPlace(col, row) {
+  if (!G.placing) return false;
+  const def = TOWERS[G.placing];
+  if (!isBuildable(col, row, G.towers)) { floatText(G.fx, col * CELL + CELL / 2, row * CELL + CELL / 2, 'Blocked!', '#ff5252'); return false; }
+  if (G.gold < def.cost) { floatText(G.fx, col * CELL + CELL / 2, row * CELL + CELL / 2, 'Need gold!', '#ff5252'); return false; }
+  G.gold -= def.cost;
+  const t = createTower(G.placing, col, row);
+  G.towers.push(t);
+  leafBurst(G.fx, t.x, t.y);
+  sfx.place();
+  updateHud();
+  return true;
+}
+
+function tryUpgrade(t) {
+  if (!canUpgrade(t)) return;
+  const cost = getUpgradeCost(t);
+  if (G.gold < cost) { floatText(G.fx, t.x, t.y - 20, 'Need gold!', '#ff5252'); return; }
+  G.gold -= cost;
+  upgradeTower(t);
+  burst(G.fx, t.x, t.y, '#ffd93b', 10, 80);
+  sfx.upgrade();
+  updateHud();
+}
+
+function sellTower(t) {
+  G.gold += sellValue(t);
+  G.towers = G.towers.filter(x => x !== t);
+  if (G.selected === t) G.selected = null;
+  sfx.sell();
+  updateHud();
+}
+
+function startWave() {
+  if (G.waveActive || G.state !== 'play' || G.wave >= TOTAL_WAVES) return;
+  G.wave += 1;
+  const q = buildQueue(G.wave);
+  G.queue = q.queue;
+  G.hpMul = q.hpMul;
+  G.waveTotal = q.total;
+  G.queueIdx = 0;
+  G.waveTime = 0;
+  G.waveActive = true;
+  const boss = G.queue.some(e => ['goliath', 'queen', 'moleking'].includes(e.id));
+  if (boss) sfx.boss(); else sfx.wave();
+  updateHud();
+}
+
+function endWave() {
+  G.waveActive = false;
+  const bonus = waveClearBonus(G.wave);
+  G.gold += bonus;
+  G.score += G.wave * 50;
+  floatText(G.fx, 480, 200, `Wave ${G.wave} clear! +🪙${bonus}`, '#ffd93b');
+  sfx.clear();
+  if (G.wave >= TOTAL_WAVES) {
+    winGame();
+  } else {
+    updateHud();
+  }
+}
+
+function winGame() {
+  G.state = 'win';
+  G.score += G.lives * 100;
+  saveBest(G.score);
+  G.best = loadBest();
+  hud.winScore.textContent = fmt(G.score);
+  hud.winBest.textContent = fmt(G.best);
+  hud.winDetail.textContent = `All 15 waves cleared · ${G.kills} pests squashed · ${G.lives === 1 ? '1 life' : G.lives + ' lives'} left · best ${fmt(G.best)}`;
+  hud.win.classList.remove('hidden');
+  sfx.win();
+  updateHud();
+}
+
+function loseGame() {
+  G.state = 'over';
+  saveBest(G.score);
+  G.best = loadBest();
+  hud.loseScore.textContent = fmt(G.score);
+  hud.loseBest.textContent = fmt(G.best);
+  hud.loseDetail.textContent = `The pests overran the garden on wave ${G.wave} · ${G.kills} pests squashed · best ${fmt(G.best)}`;
+  hud.lose.classList.remove('hidden');
+  sfx.lose();
+  updateHud();
+}
+
+function resetGame() {
   G.state = 'play';
-  G.cards = []; G.cardRects = [];
-  G.bossWarn = 0; G.winT = 0; G.best = keep.best;
-  G.camX = 0; G.camY = 0;
-  G.levelupT = 0; G.overT = 0;
-  ensureAudio();
+  G.paused = false;
+  G.speed = 1;
+  G.time = 0;
+  G.gold = START_GOLD;
+  G.lives = START_LIVES;
+  G.score = 0;
+  G.kills = 0;
+  G.wave = 0;
+  G.waveActive = false;
+  G.queue = [];
+  G.queueIdx = 0;
+  G.towers = [];
+  G.enemies = [];
+  G.projectiles = [];
+  G.fx = makeFx();
+  G.best = loadBest();
+  G.selected = null;
+  G.placing = null;
+  G.autoplay = false;
+  G.botT = 0;
+  hud.title.classList.add('hidden');
+  hud.win.classList.add('hidden');
+  hud.lose.classList.add('hidden');
+  hud.paused.classList.add('hidden');
+  updateHud();
 }
 
-function startGame() {
-  resetRun();
+// ---- combat ----
+
+function spawnEnemy(id) {
+  const e = createEnemy(id, G.hpMul);
+  G.enemies.push(e);
+  return e;
 }
 
-function endRun(won) {
-  G.state = won ? 'win' : 'over';
-  if (won) {
-    G.score += 1000 + G.player.level * 100;
-    Sound.win();
+function killEnemy(e, award = true) {
+  e.dead = true;
+  if (award) {
+    G.gold += e.def.reward;
+    G.score += e.def.reward * 2;
+    G.kills += 1;
+    burst(G.fx, e.x, e.y, e.def.color, 10, 100);
+    floatText(G.fx, e.x, e.y - 12, '+' + e.def.reward, '#ffd93b');
+    if (Math.random() < 0.4) sfx.coin();
   }
-  G.best = saveBest(G.score);
+  for (const kid of splitEnemy(e, G.hpMul)) G.enemies.push(kid);
 }
 
-// ---------- collisions ----------
-function collideProjectiles(dt) {
-  for (let i = G.projs.length - 1; i >= 0; i--) {
-    const pr = G.projs[i];
-    pr.x += pr.vx * dt;
-    pr.y += pr.vy * dt;
-    pr.life -= dt;
-    let dead = pr.life <= 0 || pr.x < 0 || pr.x > WORLD_W || pr.y < 0 || pr.y > WORLD_H;
-    if (!dead) {
-      for (const e of G.enemies) {
-        if (e.dead) continue;
-        const dx = e.x - pr.x, dy = e.y - pr.y;
-        const rr = e.r + pr.r;
-        if (dx * dx + dy * dy < rr * rr) {
-          const kb = 14;
-          const d = Math.hypot(dx, dy) || 1;
-          hurtEnemy(G, e, pr.dmg, (dx / d) * kb * 0.3, (dy / d) * kb * 0.3);
-          Sound.hit();
-          if (pr.pierce > 0) { pr.pierce -= 1; }
-          else { dead = true; break; }
+function fireShot(shot) {
+  G.projectiles.push({
+    x: shot.from.x, y: shot.from.y, px: shot.from.x, py: shot.from.y,
+    target: shot.to, speed: 460, dmg: shot.dmg, kind: shot.kind,
+    slow: shot.slow, slowDur: shot.slowDur,
+    splash: shot.splash, splashMul: shot.splashMul,
+    color: shot.color, r: 3,
+  });
+  if (shot.kind === 'thorn') sfx.thorn();
+  else if (shot.kind === 'pumpkin') sfx.splash();
+  else if (shot.kind === 'frost') sfx.frost();
+  else sfx.shoot();
+}
+
+function updateProjectiles(dt) {
+  for (const p of G.projectiles) {
+    p.px = p.x; p.py = p.y;
+    const t = p.target;
+    if (!t || t.dead) { p.done = true; continue; }
+    const dx = t.x - p.x, dy = t.y - p.y;
+    const d = Math.hypot(dx, dy);
+    const step = p.speed * dt;
+    if (d <= Math.max(step, 8)) {
+      // Hit!
+      damageEnemy(t, p.dmg);
+      G.damageDealt += p.dmg;
+      if (p.dmg >= 15) floatText(G.fx, t.x, t.y - 14, '-' + p.dmg, '#ffffff');
+      if (p.slow) slowEnemy(t, p.slow, p.slowDur);
+      if (p.splash) {
+        burst(G.fx, t.x, t.y, p.color, 6, 70);
+        for (const e of G.enemies) {
+          if (e.dead || e === t) continue;
+          if (Math.hypot(e.x - t.x, e.y - t.y) <= p.splash) {
+            damageEnemy(e, Math.round(p.dmg * p.splashMul));
+            G.damageDealt += Math.round(p.dmg * p.splashMul);
+          }
         }
+      } else {
+        burst(G.fx, t.x, t.y, p.color, 3, 50);
       }
-    }
-    if (dead) G.projs.splice(i, 1);
-  }
-}
-
-function collideBlades(dt) {
-  const w = G.weapons.blades;
-  if (!w) return;
-  const st = weaponStats('blades', w.level);
-  const p = G.player;
-  const n = 2 + (w.level - 1);
-  const radius = 95 + 14 * (w.level - 1);
-  for (const e of G.enemies) {
-    if (!e.dead) e.bladeCd = Math.max(0, (e.bladeCd || 0) - dt);
-  }
-  for (let i = 0; i < n; i++) {
-    const a = (w.angle || 0) + (i / n) * Math.PI * 2;
-    const bx = p.x + Math.cos(a) * radius;
-    const by = p.y + Math.sin(a) * radius;
-    for (const e of G.enemies) {
-      if (e.dead) continue;
-      const dx = e.x - bx, dy = e.y - by;
-      const rr = e.r + 12;
-      if (dx * dx + dy * dy < rr * rr && (e.bladeCd || 0) <= 0) {
-        e.bladeCd = 0.35;
-        hurtEnemy(G, e, st.dmg, 0, 0);
-      }
-    }
-  }
-}
-
-function collideNovas() {
-  for (let i = G.novas.length - 1; i >= 0; i--) {
-    const n = G.novas[i];
-    if (!n.applied) {
-      n.applied = true;
-      for (const e of G.enemies) {
-        if (e.dead) continue;
-        const dx = e.x - n.x, dy = e.y - n.y;
-        if (dx * dx + dy * dy < (n.r + e.r) * (n.r + e.r)) {
-          hurtEnemy(G, e, n.dmg, 0, 0);
-          e.slowT = 2;
-        }
-      }
-    }
-    n.life -= 1 / 60;
-    if (n.life <= 0) G.novas.splice(i, 1);
-  }
-}
-
-function collideEnemies(dt) {
-  const p = G.player;
-  for (const e of G.enemies) {
-    if (e.dead) continue;
-    const dx = p.x - e.x, dy = p.y - e.y;
-    const rr = p.r + e.r - 2;
-    if (dx * dx + dy * dy < rr * rr) {
-      hurtPlayer(G, e.dmg);
-    }
-  }
-}
-
-function collideBullets(dt) {
-  const p = G.player;
-  for (let i = G.bullets.length - 1; i >= 0; i--) {
-    const b = G.bullets[i];
-    b.x += b.vx * dt;
-    b.y += b.vy * dt;
-    b.life -= dt;
-    let dead = b.life <= 0 || b.x < 0 || b.x > WORLD_W || b.y < 0 || b.y > WORLD_H;
-    if (!dead) {
-      const dx = p.x - b.x, dy = p.y - b.y;
-      const rr = p.r + b.r - 2;
-      if (dx * dx + dy * dy < rr * rr) {
-        hurtPlayer(G, b.dmg);
-        dead = true;
-      }
-    }
-    if (dead) G.bullets.splice(i, 1);
-  }
-}
-
-function sweepDead() {
-  for (let i = G.enemies.length - 1; i >= 0; i--) {
-    const e = G.enemies[i];
-    if (!e.dead) continue;
-    if (!e.counted) {
-      e.counted = true;
-      onEnemyKilled(G, e);
-      if (e.type !== 'boss') addKill(G, e.x, e.y, e.xp);
-      else {
-        G.score += 500;
-        G.winT = 0.9;
-        burst(G.fx, e.x, e.y, '#ffd76a', 50, 300);
-        addShake(G.fx, 10);
-      }
-    }
-    G.enemies.splice(i, 1);
-  }
-}
-
-// ---------- autoplay bot (verification only) ----------
-function botInput() {
-  const p = G.player;
-  const inp = { up: false, down: false, left: false, right: false };
-  let tx = 0, ty = 0;
-  // dodge the nearest boss bullet
-  let bd = 130 * 130, bb = null;
-  for (const b of G.bullets) {
-    const d = (b.x - p.x) ** 2 + (b.y - p.y) ** 2;
-    if (d < bd) { bd = d; bb = b; }
-  }
-  if (bb) {
-    const dx = p.x - bb.x, dy = p.y - bb.y;
-    const d = Math.hypot(dx, dy) || 1;
-    // run perpendicular to the bullet's travel
-    const px = -bb.vy, py = bb.vx;
-    const s = (px * dx + py * dy) >= 0 ? 1 : -1;
-    tx = px * s; ty = py * s;
-  } else {
-    // nearest gem — unless hurt, then fleeing comes first
-    let gd = 420 * 420, gg = null;
-    for (const g of G.gems) {
-      const d = (g.x - p.x) ** 2 + (g.y - p.y) ** 2;
-      if (d < gd) { gd = d; gg = g; }
-    }
-    // flee the nearest enemy inside 180
-    let ed = 180 * 180, ee = null;
-    for (const e of G.enemies) {
-      const d = (e.x - p.x) ** 2 + (e.y - p.y) ** 2;
-      if (d < ed) { ed = d; ee = e; }
-    }
-    if (ee && (p.hp < 50 || !gg)) {
-      tx = p.x - ee.x; ty = p.y - ee.y;
-    } else if (gg) {
-      tx = gg.x - p.x; ty = gg.y - p.y;
-    } else if (ee) {
-      tx = p.x - ee.x; ty = p.y - ee.y;
+      if (t.dead) killEnemy(t);
+      p.done = true;
     } else {
-      // drift toward the arena middle
-      tx = WORLD_W / 2 - p.x; ty = WORLD_H / 2 - p.y;
+      p.x += (dx / d) * step;
+      p.y += (dy / d) * step;
     }
   }
-  const len = Math.hypot(tx, ty);
-  if (len > 8) {
-    const nx = tx / len, ny = ty / len;
-    if (ny < -0.4) inp.up = true;
-    if (ny > 0.4) inp.down = true;
-    if (nx < -0.4) inp.left = true;
-    if (nx > 0.4) inp.right = true;
+  G.projectiles = G.projectiles.filter(p => !p.done);
+  // Sweep kills from splash damage (splash may kill non-targets).
+  for (const e of [...G.enemies]) {
+    if (e.dead && !e.counted) { e.counted = true; killEnemy(e); }
   }
-  return inp;
+  G.enemies = G.enemies.filter(e => !e.dead);
 }
 
-// ---------- update ----------
 function update(dt) {
-  if (G.bossWarn > 0) G.bossWarn -= dt;
-  for (const z of G.zaps) z.life -= dt;
-  G.zaps = G.zaps.filter(z => z.life > 0);
-  if (G.state !== 'play') return;
-  const input = G.autoplay ? botInput() : G.input;
-  updateWorld(G, dt);
-  updatePlayer(G, dt, input);
-  for (const e of G.enemies) updateEnemy(G, e, dt);
-  collideProjectiles(dt);
-  collideBlades(dt);
-  collideNovas();
-  collideEnemies(dt);
-  collideBullets(dt);
-  sweepDead();
+  if (G.state !== 'play' || G.paused) return;
+  G.time += dt;
   updateFx(G.fx, dt);
-  // camera follows the player
-  G.camX = Math.max(0, Math.min(WORLD_W - VIEW_W, G.player.x - VIEW_W / 2));
-  G.camY = Math.max(0, Math.min(WORLD_H - VIEW_H, G.player.y - VIEW_H / 2));
-  // boss killed -> win after the burst
-  if (G.winT > 0) {
-    G.winT -= dt;
-    if (G.winT <= 0) endRun(true);
-  }
-  // player died
-  if (G.player.dead && G.state === 'play') {
-    endRun(false);
-    return;
-  }
-  // level-up queue
-  if (G.pendingLevels > 0 && G.state === 'play') {
-    G.cards = rollCards(G);
-    G.state = 'levelup';
-    G.levelupT = 0;
-    Sound.levelup();
-  }
-}
 
-function pickCard(i) {
-  if (G.state !== 'levelup') return;
-  const c = G.cards[i];
-  if (!c) return;
-  applyCard(G, c);
-  G.pendingLevels -= 1;
-  Sound.click();
-  if (G.pendingLevels > 0) {
-    G.cards = rollCards(G);
-    G.levelupT = 0;
-  } else {
-    G.state = 'play';
-  }
-}
-
-// ---------- loop ----------
-let last = performance.now();
-let acc = 0;
-function frame(now) {
-  const dtMs = Math.min(100, now - last);
-  last = now;
-  acc += dtMs / 1000;
-  const step = 1 / 60;
-  let n = 0;
-  while (acc >= step && n < 5) {
-    // autoplay picks a card on its own
-    if (G.state === 'levelup' && G.autoplay) {
-      G.levelupT += step;
-      if (G.levelupT > 0.4) pickCard(0);
+  // Spawn from the queue.
+  if (G.waveActive) {
+    G.waveTime += dt;
+    while (G.queueIdx < G.queue.length && G.queue[G.queueIdx].at <= G.waveTime) {
+      spawnEnemy(G.queue[G.queueIdx].id);
+      G.queueIdx += 1;
     }
-    update(step);
-    acc -= step;
-    n++;
   }
-  if (n === 5) acc = 0;
-  render(now / 1000);
-  requestAnimationFrame(frame);
-}
 
-function render(t) {
-  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
-  if (G.state === 'title') drawTitle(ctx, G, G.best);
-  else if (G.state === 'levelup') { drawGame(ctx, G, t); drawLevelUp(ctx, G); }
-  else if (G.state === 'pause') { drawGame(ctx, G, t); drawPause(ctx); }
-  else if (G.state === 'over') { drawGame(ctx, G, t); drawEnd(ctx, G, G.best, false); }
-  else if (G.state === 'win') { drawGame(ctx, G, t); drawEnd(ctx, G, G.best, true); }
-  else drawGame(ctx, G, t);
-}
-
-// ---------- input ----------
-const keyMap = { ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down', ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right' };
-
-window.addEventListener('keydown', (ev) => {
-  ensureAudio();
-  const k = ev.code;
-  if (keyMap[k]) {
-    G.input[keyMap[k]] = true;
-    ev.preventDefault();
-    return;
+  // Towers fire.
+  for (const t of G.towers) {
+    const shot = updateTower(t, dt, G.enemies);
+    if (shot) fireShot(shot);
   }
-  if (k === 'Enter') {
-    if (G.state === 'title') startGame();
-    else if (G.state === 'over' || G.state === 'win') G.state = 'title';
-  } else if (k === 'KeyP') {
-    if (G.state === 'play') G.state = 'pause';
-    else if (G.state === 'pause') G.state = 'play';
-  } else if (k === 'KeyM') {
-    toggleMute();
-  } else if (k === 'KeyR') {
-    if (G.state !== 'title') startGame();
-  } else if (k === 'Digit1' || k === 'Digit2' || k === 'Digit3') {
-    pickCard(Number(k.slice(-1)) - 1);
-  }
-});
+  updateProjectiles(dt);
 
-window.addEventListener('keyup', (ev) => {
-  const k = keyMap[ev.code];
-  if (k) G.input[k] = false;
-});
-
-canvas.addEventListener('click', (ev) => {
-  ensureAudio();
-  const r = canvas.getBoundingClientRect();
-  const x = (ev.clientX - r.left) * (VIEW_W / r.width);
-  const y = (ev.clientY - r.top) * (VIEW_H / r.height);
-  if (G.state === 'title') { startGame(); return; }
-  if (G.state === 'levelup') {
-    for (const cr of G.cardRects || []) {
-      if (x >= cr.x && x <= cr.x + cr.w && y >= cr.y && y <= cr.y + cr.h) {
-        pickCard(cr.i);
+  // Pests march, heal, spawn minions, leak.
+  healAura(G.enemies, dt);
+  for (const e of [...G.enemies]) {
+    if (e.dead) continue;
+    const ev = updateEnemy(e, dt);
+    if (ev.spawn) {
+      const m = spawnEnemy(ev.spawn);
+      m.dist = Math.max(0, e.dist - 10);
+      const pos = { x: e.x, y: e.y };
+      m.x = pos.x; m.y = pos.y;
+    }
+    if (ev.leaked) {
+      e.dead = true;
+      G.lives -= e.def.leak;
+      floatText(G.fx, 900, 220, `-${e.def.leak} ❤`, '#ff5252');
+      sfx.leak();
+      if (G.lives <= 0) {
+        G.lives = 0;
+        G.enemies = G.enemies.filter(x => !x.dead);
+        updateHud();
+        loseGame();
         return;
       }
     }
   }
-  if (G.state === 'over' || G.state === 'win') { G.state = 'title'; }
+  G.enemies = G.enemies.filter(e => !e.dead);
+
+  // Wave cleared?
+  if (G.waveActive && G.queueIdx >= G.queue.length && G.enemies.length === 0) {
+    endWave();
+  }
+
+  // Autoplay bot.
+  if (G.autoplay) botTick(dt);
+
+  updateHud();
+}
+
+// ---- autoplay bot (plays the real economy: places, upgrades, starts waves) ----
+
+function botTick(dt) {
+  G.botT += dt;
+  if (G.botT < 0.5) return;
+  G.botT = 0;
+  if (G.state !== 'play' || G.paused) return;
+
+  const count = id => G.towers.filter(t => t.type === id).length;
+  const emptySpots = SPOT_CACHE.filter(s => isBuildable(s.col, s.row, G.towers));
+
+  // 1. Once the garden has a backbone, upgrades beat more towers: an
+  // upgraded tower hits harder per gold than a fresh level-1 one.
+  // Late on, Thorn Lashes are the boss killers — upgrade those first.
+  if (G.towers.length >= 10 && G.gold >= 120) {
+    const upgradable = G.towers.filter(t => canUpgrade(t))
+      .sort((a, b) => {
+        if (G.wave >= 13) {
+          const ta = a.type === 'thorn' ? 0 : 1, tb = b.type === 'thorn' ? 0 : 1;
+          if (ta !== tb) return ta - tb;
+        }
+        return spotScore(b.col, b.row, 100) - spotScore(a.col, a.row, 100);
+      });
+    if (upgradable.length > 0) {
+      const t = upgradable[0];
+      const cost = getUpgradeCost(t);
+      if (G.gold >= cost) {
+        G.gold -= cost;
+        upgradeTower(t);
+        burst(G.fx, t.x, t.y, '#ffd93b', 8, 70);
+        return;
+      }
+    }
+  }
+
+  // 2. Place a tower if we can afford one and a good spot is open.
+  if (emptySpots.length > 0) {
+    const spot = emptySpots[0];
+    let pick = null;
+    const nextWave = G.wave + 1;
+    const bossNext = [5, 10, 15].includes(nextWave);
+    if (count('daisy') < 3 && G.gold >= TOWERS.daisy.cost) pick = 'daisy';
+    else if (count('frost') < 1 && G.gold >= TOWERS.frost.cost && G.wave >= 1) pick = 'frost';
+    else if (count('pumpkin') < 1 && G.gold >= TOWERS.pumpkin.cost && G.wave >= 2) pick = 'pumpkin';
+    else if (bossNext && count('thorn') < 3 && G.gold >= TOWERS.thorn.cost) pick = 'thorn';
+    else if (G.gold >= TOWERS.pumpkin.cost && count('pumpkin') < 6) pick = 'pumpkin';
+    else if (G.gold >= TOWERS.daisy.cost && count('daisy') < 12) pick = 'daisy';
+    else if (G.gold >= TOWERS.thorn.cost) pick = 'thorn';
+    if (pick) {
+      const def = TOWERS[pick];
+      G.gold -= def.cost;
+      const t = createTower(pick, spot.col, spot.row);
+      G.towers.push(t);
+      leafBurst(G.fx, t.x, t.y);
+      return;
+    }
+  }
+
+  // 3. Upgrade the weakest tower near the path when flush.
+  if (G.gold >= 150) {
+    const upgradable = G.towers.filter(t => canUpgrade(t))
+      .sort((a, b) => spotScore(b.col, b.row, 100) - spotScore(a.col, a.row, 100));
+    if (upgradable.length > 0) {
+      const t = upgradable[0];
+      const cost = getUpgradeCost(t);
+      if (G.gold >= cost) {
+        G.gold -= cost;
+        upgradeTower(t);
+        burst(G.fx, t.x, t.y, '#ffd93b', 8, 70);
+        return;
+      }
+    }
+  }
+
+  // 4. Start the next wave when the field is clear.
+  if (!G.waveActive && G.enemies.length === 0 && G.wave < TOTAL_WAVES) {
+    startWave();
+  }
+}
+
+// ---- input ----
+
+function canvasCell(ev) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+  const y = (ev.clientY - rect.top) * (canvas.height / rect.height);
+  return { col: Math.floor(x / CELL), row: Math.floor(y / CELL), x, y };
+}
+
+canvas.addEventListener('mousemove', ev => {
+  const c = canvasCell(ev);
+  G.hover = c;
+  if (G.placing) {
+    // nothing else needed; render draws the ghost
+  }
 });
 
-// ---------- debug hooks (verification only) ----------
+canvas.addEventListener('mouseleave', () => { G.hover = null; });
+
+canvas.addEventListener('contextmenu', ev => {
+  ev.preventDefault();
+  selectPlacing(null);
+});
+
+canvas.addEventListener('click', ev => {
+  ensureAudio();
+  if (G.state !== 'play' || G.paused) return;
+  const c = canvasCell(ev);
+  if (G.placing) {
+    if (tryPlace(c.col, c.row)) {
+      // Keep placing while affordable (shift held = place many).
+      if (!ev.shiftKey || G.gold < TOWERS[G.placing].cost) selectPlacing(null);
+    }
+    return;
+  }
+  const t = G.towers.find(t => t.col === c.col && t.row === c.row);
+  G.selected = t || null;
+  updateHud();
+});
+
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape') { selectPlacing(null); G.selected = null; updateHud(); return; }
+  if (G.state === 'title' && (ev.key === 'Enter' || ev.key === ' ')) { ensureAudio(); resetGame(); return; }
+  if ((G.state === 'win' || G.state === 'over') && (ev.key === 'Enter' || ev.key === 'r' || ev.key === 'R')) { ensureAudio(); resetGame(); return; }
+  if (G.state !== 'play') return;
+  const k = ev.key.toLowerCase();
+  if (k >= '1' && k <= '4') {
+    const id = TOWER_ORDER[Number(k) - 1];
+    selectPlacing(G.placing === id ? null : id);
+  } else if (k === ' ') { ev.preventDefault(); startWave(); }
+  else if (k === 'f') { G.speed = G.speed === 1 ? 2 : 1; updateHud(); }
+  else if (k === 'p') { togglePause(); }
+  else if (k === 'm') { setMuted(!isMuted()); updateHud(); }
+  else if (k === 'r') { resetGame(); }
+  else if (k === 'u' && G.selected) { tryUpgrade(G.selected); }
+});
+
+function togglePause() {
+  if (G.state !== 'play') return;
+  G.paused = !G.paused;
+  hud.paused.classList.toggle('hidden', !G.paused);
+  updateHud();
+}
+
+hud.waveBtn.onclick = () => { ensureAudio(); startWave(); };
+hud.speedBtn.onclick = () => { G.speed = G.speed === 1 ? 2 : 1; updateHud(); };
+hud.pauseBtn.onclick = () => togglePause();
+hud.muteBtn.onclick = () => { setMuted(!isMuted()); updateHud(); };
+hud.restartBtn.onclick = () => { ensureAudio(); resetGame(); };
+$('btn-start').onclick = () => { ensureAudio(); resetGame(); };
+$('btn-again-win').onclick = () => { ensureAudio(); resetGame(); };
+$('btn-again-lose').onclick = () => { ensureAudio(); resetGame(); };
+$('btn-help').onclick = () => { $('help-box').classList.toggle('hidden'); };
+
+// ---- main loop ----
+
+let last = performance.now();
+function frame(now) {
+  const raw = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  const dt = raw * (G.state === 'play' && !G.paused ? G.speed : 1);
+  update(dt);
+  draw(ctx, G, {
+    placing: G.placing,
+    placingDef: G.placing ? TOWERS[G.placing] : null,
+    hover: G.hover,
+    hoverOk: G.hover ? isBuildable(G.hover.col, G.hover.row, G.towers) : false,
+    selected: G.selected,
+  });
+  requestAnimationFrame(frame);
+}
+
+hud.titleBest.textContent = fmt(G.best);
+updateHud();
+requestAnimationFrame(frame);
+
+// ---- debug hooks (used by the playtest harness, not by players) ----
 window.__game = {
-  G,
   state() {
+    const boss = G.enemies.find(e => e.def.boss);
     return {
-      state: G.state, time: Math.round(G.time * 10) / 10,
-      score: G.score, hp: Math.round(G.player.hp), level: G.player.level,
-      kills: G.player.kills, enemies: G.enemies.length, gems: G.gems.length,
-      x: Math.round(G.player.x), y: Math.round(G.player.y),
-      bossHp: (G.enemies.find(e => e.type === 'boss') || {}).hp ?? null,
-      weapons: Object.keys(G.weapons),
+      state: G.state, wave: G.wave, gold: Math.floor(G.gold), lives: G.lives,
+      score: Math.floor(G.score), kills: G.kills,
+      enemies: G.enemies.length, towers: G.towers.length,
+      waveActive: G.waveActive, paused: G.paused,
+      bossHp: boss ? { hp: boss.hp, max: boss.maxHp, id: boss.id } : null,
     };
   },
-  start() { startGame(); },
-  warp(t) { G.time = t; G.spawnT = 0; G.eliteT = 30; },
-  giveBuild() {
-    const p = G.player;
-    p.level = 12;
-    p.xpNeed = 200;
-    G.weapons = {
-      bolt: { level: 5, cd: 0, angle: 0 },
-      blades: { level: 5, cd: 0, angle: 0 },
-      nova: { level: 5, cd: 0, angle: 0 },
-      chain: { level: 5, cd: 0, angle: 0 },
-      volley: { level: 5, cd: 0, angle: 0 },
-    };
-    G.passives = { boots: 3, magnet: 3, armor: 3, vitality: 5, crit: 3, haste: 3, greed: 2, regen: 3 };
-    p.maxHp = 100 + 25 * 5;
-    p.hp = p.maxHp;
-  },
-  god() { G.god = !G.god; return G.god; },
-  autoplay(on) { G.autoplay = !!on; return G.autoplay; },
-  spawnBoss() {
-    if (G.bossSpawned) return false;
-    G.time = Math.max(G.time, BOSS_TIME);
+  start() { ensureAudio(); resetGame(); },
+  autoplay(on) { G.autoplay = !!on; },
+  setSpeed(n) { G.speed = n === 4 ? 4 : (n === 2 ? 2 : 1); updateHud(); },
+  startWave() { startWave(); },
+  place(type, col, row) {
+    if (!TOWERS[type]) return false;
+    if (G.gold < TOWERS[type].cost) return false;
+    if (!isBuildable(col, row, G.towers)) return false;
+    G.gold -= TOWERS[type].cost;
+    G.towers.push(createTower(type, col, row));
     return true;
   },
+  debug() {
+    return {
+      towers: G.towers.map(t => ({ type: t.type, col: t.col, row: t.row, x: t.x, y: t.y, cd: t.cd, level: t.level })),
+      projectiles: G.projectiles.length,
+      enemies: G.enemies.slice(0, 3).map(e => ({ id: e.id, x: Math.round(e.x), y: Math.round(e.y), hp: e.hp, dist: Math.round(e.dist), dead: e.dead })),
+    };
+  },
 };
-
-requestAnimationFrame(frame);
